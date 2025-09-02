@@ -1,4 +1,3 @@
-// backend/server.js - Updated for username-based login
 const express = require("express");
 const cors = require("cors");
 const { ethers } = require("ethers");
@@ -38,9 +37,10 @@ const contract = new ethers.Contract(CONTRACT_ADDRESS, contractABI, provider);
 // --- Step 4: Define Mongoose Schemas ---
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
-    email: { type: String, required: true },
+    email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     collegeAddress: { type: String, default: null },
+    role: { type: String, enum: ['college', 'student'], default: 'student' }
 }, { timestamps: true });
 
 const AccreditationRequest = mongoose.model("AccreditationRequest", new mongoose.Schema({
@@ -93,28 +93,46 @@ const authenticateJWT = (req, res, next) => {
 // Authentication Endpoints
 app.post("/api/signup", async (req, res) => {
     try {
-        const { username, email, password } = req.body;
+        const { username, email, password, role } = req.body;
         
-        // Check if user already exists
         const existingUser = await User.findOne({ $or: [{ username }, { email }] });
         if (existingUser) {
             return res.status(400).json({ error: "User with this username or email already exists" });
         }
         
-        // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
         
-        // Create new user
         const newUser = new User({
             username,
             email,
-            password: hashedPassword
+            password: hashedPassword,
+            role: role || 'student'
         });
         
         await newUser.save();
         
-        console.log(`🔔 New user registered: ${username}`);
-        res.status(201).json({ message: "User registered successfully. Please link your wallet." });
+        console.log(`🔔 New user registered: ${username} (Role: ${newUser.role})`);
+
+        if (newUser.role === 'student') {
+            const token = jwt.sign(
+                { 
+                    userId: newUser._id, 
+                    username: newUser.username, 
+                    email: newUser.email,
+                    collegeAddress: newUser.collegeAddress,
+                    role: newUser.role
+                }, 
+                JWT_SECRET, 
+                { expiresIn: '1h' }
+            );
+            return res.status(201).json({ 
+                message: "Student registered successfully.",
+                token,
+                role: newUser.role
+            });
+        }
+        
+        res.status(201).json({ message: "College registered successfully. Please link your wallet." });
     } catch (err) {
         console.error("Error in /api/signup:", err);
         res.status(500).json({ error: "Internal Server Error" });
@@ -125,35 +143,34 @@ app.post("/api/login", async (req, res) => {
     try {
         const { username, password } = req.body;
         
-        // Find user by username
         const user = await User.findOne({ username });
         if (!user) {
             return res.status(401).json({ error: "Invalid username or password" });
         }
         
-        // Compare passwords
         const isPasswordValid = await bcrypt.compare(password, user.password);
         if (!isPasswordValid) {
             return res.status(401).json({ error: "Invalid username or password" });
         }
         
-        // Generate JWT
         const token = jwt.sign(
             { 
                 userId: user._id, 
                 username: user.username, 
                 email: user.email,
-                collegeAddress: user.collegeAddress 
+                collegeAddress: user.collegeAddress,
+                role: user.role
             }, 
             JWT_SECRET, 
             { expiresIn: '1h' }
         );
         
-        console.log(`🔑 User logged in: ${username}`);
+        console.log(`🔑 User logged in: ${username} (Role: ${user.role})`);
         res.json({ 
             message: "Login successful", 
             token,
-            collegeAddress: user.collegeAddress
+            collegeAddress: user.collegeAddress,
+            role: user.role
         });
     } catch (error) {
         console.error("Error in /api/login:", error);
@@ -165,23 +182,21 @@ app.post("/api/link-wallet", async (req, res) => {
     try {
         const { email, walletAddress } = req.body;
         
-        // Find user by email
         const user = await User.findOne({ email });
         if (!user) {
             return res.status(404).json({ error: "User not found" });
         }
         
-        // Update user with wallet address
         user.collegeAddress = walletAddress;
         await user.save();
         
-        // Generate JWT
         const token = jwt.sign(
             { 
                 userId: user._id, 
                 username: user.username,
                 email: user.email, 
-                collegeAddress: walletAddress 
+                collegeAddress: walletAddress,
+                role: user.role
             }, 
             JWT_SECRET, 
             { expiresIn: '1h' }
@@ -191,7 +206,8 @@ app.post("/api/link-wallet", async (req, res) => {
         res.json({ 
             message: "Wallet linked successfully", 
             token,
-            collegeAddress: walletAddress
+            collegeAddress: walletAddress,
+            role: user.role
         });
     } catch (err) {
         console.error("Error in /api/link-wallet:", err);
@@ -199,7 +215,6 @@ app.post("/api/link-wallet", async (req, res) => {
     }
 });
 
-// Protected endpoint to get user info
 app.get("/api/user", authenticateJWT, async (req, res) => {
     try {
         const user = await User.findById(req.user.userId).select('-password');
@@ -213,12 +228,13 @@ app.get("/api/user", authenticateJWT, async (req, res) => {
     }
 });
 
-// A College submits a request for accreditation
 app.post("/api/request-accreditation", authenticateJWT, async (req, res) => {
     try {
         const { collegeAddress, collegeName } = req.body;
         
-        // Verify the authenticated user matches the college address
+        if (req.user.role !== 'college') {
+            return res.status(403).json({ error: "Unauthorized: Only colleges can request accreditation." });
+        }
         if (req.user.collegeAddress.toLowerCase() !== collegeAddress.toLowerCase()) {
             return res.status(403).json({ error: "Unauthorized: You can only submit requests for your own address" });
         }
@@ -239,7 +255,6 @@ app.post("/api/request-accreditation", authenticateJWT, async (req, res) => {
     }
 });
 
-// The Admin approves a pending request
 app.post("/api/admin/approve-request", async (req, res) => {
     try {
         const { requestId, secretKey } = req.body;
@@ -248,7 +263,7 @@ app.post("/api/admin/approve-request", async (req, res) => {
         const request = await AccreditationRequest.findById(requestId);
         if (!request || request.status !== 'pending') return res.status(404).json({ error: "No pending request found with this ID." });
         
-        const validUntil = Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60); // Valid for 1 year
+        const validUntil = Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60); // 1 year
         const domain = { name: "AccreditationRegistry", version: "1", chainId: 97, verifyingContract: CONTRACT_ADDRESS };
         const types = { ProofOfAccreditation: [{ name: "college", type: "address" }, { name: "collegeName", type: "string" }, { name: "validUntil", type: "uint256" }] };
         const value = { college: request.collegeAddress, collegeName: request.collegeName, validUntil };
@@ -267,7 +282,6 @@ app.post("/api/admin/approve-request", async (req, res) => {
     }
 });
 
-// The Admin rejects a pending request
 app.post("/api/admin/reject-request", async (req, res) => {
     try {
         const { requestId, secretKey } = req.body;
@@ -287,10 +301,11 @@ app.post("/api/admin/reject-request", async (req, res) => {
     }
 });
 
-// A College checks the status of their request
 app.get("/api/check-status/:collegeAddress", authenticateJWT, async (req, res) => {
     try {
-        // Verify the authenticated user matches the college address
+        if (req.user.role !== 'college') {
+            return res.status(403).json({ error: "Unauthorized: Only colleges can check accreditation status." });
+        }
         if (req.user.collegeAddress.toLowerCase() !== req.params.collegeAddress.toLowerCase()) {
             return res.status(403).json({ error: "Unauthorized: You can only check your own status" });
         }
@@ -305,12 +320,13 @@ app.get("/api/check-status/:collegeAddress", authenticateJWT, async (req, res) =
     }
 });
 
-// A College checks for certificate duplicates before issuing
 app.post("/api/check-duplicate", authenticateJWT, async (req, res) => {
     try {
         const { collegeAddress, rollNo } = req.body;
         
-        // Verify the authenticated user matches the college address
+        if (req.user.role !== 'college') {
+            return res.status(403).json({ error: "Unauthorized: Only colleges can check for duplicates." });
+        }
         if (req.user.collegeAddress.toLowerCase() !== collegeAddress.toLowerCase()) {
             return res.status(403).json({ error: "Unauthorized: You can only check duplicates for your own college" });
         }
@@ -328,7 +344,6 @@ app.post("/api/check-duplicate", authenticateJWT, async (req, res) => {
     }
 });
 
-// The Frontend syncs a new certificate to the DB cache
 app.post("/api/sync", authenticateJWT, async (req, res) => {
     try {
         const { certificateId, txHash } = req.body;
@@ -337,20 +352,16 @@ app.post("/api/sync", authenticateJWT, async (req, res) => {
         
         if (!exists) return res.status(404).json({ error: 'Certificate not found on-chain during sync.' });
         
-        // Verify the authenticated user matches the issuedBy address
+        if (req.user.role !== 'college') {
+            return res.status(403).json({ error: "Unauthorized: Only colleges can sync certificates." });
+        }
         if (req.user.collegeAddress.toLowerCase() !== issuedBy.toLowerCase()) {
             return res.status(403).json({ error: "Unauthorized: You can only sync certificates issued by your college" });
         }
         
         const newCert = new Certificate({ 
-            certificateId: id, 
-            studentName, 
-            course, 
-            rollNo, 
-            dateOfIssuing, 
-            issuedBy, 
-            issuedAt: Number(issuedAt), 
-            txHash 
+            certificateId: id, studentName, course, rollNo, dateOfIssuing, issuedBy, 
+            issuedAt: Number(issuedAt), txHash 
         });
         
         await newCert.save();
@@ -361,33 +372,35 @@ app.post("/api/sync", authenticateJWT, async (req, res) => {
     }
 });
 
-// Anyone verifies a certificate (cache-first)
+// MODIFIED: This endpoint now handles the entire verification flow automatically.
 app.get("/api/verify/:certificateId", async (req, res) => {
     try {
         const { certificateId } = req.params;
+        
+        // 1. Check database cache first
         const cachedCert = await Certificate.findOne({ certificateId });
+        if (cachedCert) {
+            return res.json({ valid: true, source: 'cache', certificate: cachedCert });
+        }
         
-        if (cachedCert) return res.json({ valid: true, source: 'cache', certificate: cachedCert });
-        
+        // 2. If not in cache, automatically fetch from blockchain
         const onChainCert = await contract.getCertificate(certificateId);
         const [id, studentName, course, rollNo, dateOfIssuing, issuedBy, issuedAt, exists] = onChainCert;
         
         if (exists) {
-            const newCert = new Certificate({ 
-                certificateId: id, 
-                studentName, 
-                course, 
-                rollNo, 
-                dateOfIssuing, 
-                issuedBy, 
+            const newCertData = { 
+                certificateId: id, studentName, course, rollNo, dateOfIssuing, issuedBy, 
                 issuedAt: Number(issuedAt) 
-            });
+            };
             
-            await newCert.save();
-            return res.json({ valid: true, source: 'blockchain', certificate: newCert });
+            // 3. Save the fetched certificate to the cache for future requests
+            await Certificate.findOneAndUpdate({ certificateId: id }, newCertData, { upsert: true });
+            
+            return res.json({ valid: true, source: 'blockchain', certificate: newCertData });
         }
         
-        res.status(404).json({ valid: false, message: "Certificate not found." });
+        // 4. If not found anywhere, return an error
+        res.status(404).json({ valid: false, message: "Certificate not found in database or on the blockchain." });
     } catch (err) {
         console.error("Error in /api/verify:", err);
         res.status(500).json({ error: "Internal Server Error" });
